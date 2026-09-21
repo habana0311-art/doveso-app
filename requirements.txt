@@ -1,5 +1,6 @@
 streamlit
-google-genai
+easyocr
+opencv-python-headless
 pillow
 requests
 beautifulsoup4
