@@ -1,28 +1,15 @@
 import streamlit as st
-import json
+import re
 import requests
-import time
 from bs4 import BeautifulSoup
 from PIL import Image
-from google import genai
-from google.genai import types
+import pytesseract
 
 # Cấu hình giao diện Streamlit
-st.set_page_config(page_title="Dò Vé Số Tự Động", page_icon="🎫", layout="centered")
+st.set_page_config(page_title="Dò Vé Số Tự Động (Tesseract OCR)", page_icon="🎫", layout="centered")
 
-st.title("🎫 Dò Vé Số Tự Động bằng Gemini AI")
-
-# Lấy API Key từ Streamlit Secrets hoặc ô nhập tay trên giao diện
-api_key = st.secrets.get("GEMINI_API_KEY", None)
-
-if not api_key:
-    api_key = st.sidebar.text_input("🔑 Nhập Google Gemini API Key:", type="password")
-    if not api_key:
-        st.info("💡 Bạn cần nhập Gemini API Key ở thanh bên (Sidebar) để ứng dụng hoạt động.")
-        st.stop()
-
-# Khởi tạo client Gemini
-client = genai.Client(api_key=api_key)
+st.title("🎫 Dò Vé Số Tự Động (Tesseract OCR)")
+st.caption("Chạy hoàn toàn cục bộ trên Streamlit — Không dùng API bên ngoài, không lo quá tải 503, không lo đổi tên mô hình!")
 
 # Bảng quy đổi tên nhà đài sang mã đường dẫn web
 PROVINCE_MAP = {
@@ -107,34 +94,47 @@ def check_ticket_all_prizes(ticket_num, kqxs):
                     
     return results
 
-def extract_from_image(image):
-    prompt = """
-    Phân tích ảnh vé số Việt Nam và trích xuất danh sách TẤT CẢ các vé số trong ảnh.
-    Trả về định dạng JSON thuần túy gồm danh sách dạng:
-    [
-      {
-        "province": "Tên tỉnh/nhà đài (VD: TP.HCM, Long An, Hậu Giang...)",
-        "draw_date": "Ngày xổ số dạng DD-MM-YYYY (VD: 19-09-2026)",
-        "ticket_number": "Dãy số dự thưởng 6 chữ số (VD: 452029)"
-      }
-    ]
-    """
+def extract_tickets_ocr(image):
+    """Trích xuất chữ từ ảnh bằng Tesseract OCR"""
+    full_text = pytesseract.image_to_string(image, lang='vie+eng')
     
-    # Tự động thử lại 3 lần nếu máy chủ Google báo bận/quá tải (503)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            res = client.models.generate_content(
-                model='gemini-2.0-flash',  # Mô hình chuẩn, nhanh và ổn định nhất
-                contents=[image, prompt],
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            return json.loads(res.text)
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)  # Đợi 2 giây rồi tự động thử lại
-            else:
-                raise e
+    # 1. Trích xuất dãy số 6 chữ số
+    numbers = re.findall(r'\b\d{6}\b', full_text)
+    numbers = list(dict.fromkeys(numbers))
+    
+    # 2. Trích xuất ngày xổ
+    dates = re.findall(r'\b\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4}\b', full_text)
+    found_date = dates[0].replace('/', '-').replace('.', '-') if dates else ""
+    if found_date:
+        parts = found_date.split('-')
+        if len(parts) == 3:
+            day, month, year = parts
+            found_date = f"{int(day):02d}-{int(month):02d}-{year}"
+
+    # 3. Trích xuất tên nhà đài
+    found_province = ""
+    upper_text = full_text.upper()
+    for prov in PROVINCE_MAP.keys():
+        if prov in upper_text:
+            found_province = prov
+            break
+            
+    tickets = []
+    if numbers:
+        for num in numbers:
+            tickets.append({
+                "province": found_province,
+                "draw_date": found_date,
+                "ticket_number": num
+            })
+    else:
+        tickets.append({
+            "province": found_province,
+            "draw_date": found_date,
+            "ticket_number": ""
+        })
+        
+    return tickets, full_text
 
 # --- GIAO DIỆN CHÍNH ---
 uploaded_file = st.file_uploader("📸 Chọn ảnh chụp vé số của bạn", type=["jpg", "jpeg", "png", "webp"])
@@ -143,10 +143,10 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file)
     st.image(image, caption="Ảnh vé số đã tải lên", use_container_width=True)
     
-    with st.spinner("🔍 AI đang phân tích vé số..."):
+    with st.spinner("🔍 Hệ thống đang quét ảnh bằng Tesseract OCR..."):
         try:
-            tickets = extract_from_image(image)
-            st.success(f"Phân tích thành công! Nhận diện được {len(tickets)} vé số.")
+            tickets, raw_text = extract_tickets_ocr(image)
+            st.success(f"Quét hoàn tất!")
             
             for i, ticket in enumerate(tickets, 1):
                 st.write("---")
@@ -158,7 +158,7 @@ if uploaded_file is not None:
                 num = col3.text_input("Số dự thưởng (6 chữ số)", value=ticket.get("ticket_number", ""), key=f"n_{i}")
                 
                 if not num or len(num) != 6:
-                    st.warning("Vui lòng kiểm tra lại dãy số (phải đủ 6 chữ số).")
+                    st.warning("Vui lòng kiểm tra/nhập đúng dãy số 6 chữ số.")
                     continue
                     
                 slug = get_slug(prov)
@@ -189,5 +189,8 @@ if uploaded_file is not None:
                         with st.expander("📄 Xem Bảng KQXS chi tiết"):
                             st.json(kqxs)
                             
+            with st.expander("🔍 Xem văn bản thô OCR nhận diện được từ ảnh"):
+                st.text(raw_text)
+
         except Exception as e:
-            st.error(f"⚠️ Máy chủ Google Gemini đang quá tải tạm thời. Bạn vui lòng đợi 3-5 giây rồi tải lại ảnh nhé!\nChi tiết: {e}")
+            st.error(f"Lỗi khi xử lý ảnh: {e}")
